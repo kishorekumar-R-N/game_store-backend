@@ -21,3 +21,7 @@ build/
 
 # VSCode settings
 .vscode/
+
+# .gitignore
+.env
+
