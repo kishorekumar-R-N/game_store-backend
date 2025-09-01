@@ -24,7 +24,7 @@ const connectDB = async () => {
     });
     console.log('MongoDB Atlas connected successfully');
   } catch (error) {
-    console.error('MongoDB connection error:', error);
+    console.error('MongoDB connection error:', error); 
     process.exit(1);
   }
 };
@@ -83,13 +83,30 @@ const userSchema = new mongoose.Schema({
   lastLogin: {
     type: Date,
     default: Date.now
+  },
+  role: {
+    type: String,
+    enum: ['user', 'admin'],
+    default: 'user'
   }
 });
 
 // Create User model
 const User = mongoose.model('User', userSchema);
 
-// JWT Middleware for protected routes
+// Game Schema
+const gameSchema = new mongoose.Schema({
+  title: { type: String, required: true },
+  description: { type: String, required: true },
+  image: { type: String },
+  price: { type: Number, required: true },
+  genre: { type: String },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const Game = mongoose.model('Game', gameSchema);
+
+// JWT Middleware for protected routes (SINGLE DEFINITION)
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -116,6 +133,72 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString(),
     status: 'healthy'
   });
+});
+
+// Add a new game (Admin only)
+app.post('/api/games', authenticateToken, async (req, res) => {
+  try {
+    // Removed admin-only check; any authenticated user can add games
+    console.log('Add Game Request Body:', req.body); // Debug log
+    const { title, description, image, price, genre } = req.body;
+    if (!title || !description || !price) {
+      return res.status(400).json({ message: 'Title, description, and price are required.' });
+    }
+    const newGame = new Game({ title, description, image, price, genre });
+    await newGame.save();
+    res.status(201).json({ message: 'Game added successfully', game: newGame });
+  } catch (error) {
+    console.error('Add game error:', error);
+    res.status(500).json({ message: 'Error adding game' });
+  }
+});
+
+// Get all games
+app.get('/api/games', async (req, res) => {
+  try {
+    const games = await Game.find().sort({ createdAt: -1 });
+    res.json({ games });
+  } catch (error) {
+    console.error('Fetch games error:', error);
+    res.status(500).json({ message: 'Error fetching games' });
+  }
+});
+
+// Update a game (Admin only)
+app.put('/api/games/:id', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ message: 'Admin access required' });
+    }
+    const { id } = req.params;
+    const { title, description, image, price, genre } = req.body;
+    const updated = await Game.findByIdAndUpdate(
+      id,
+      { title, description, image, price, genre },
+      { new: true }
+    );
+    if (!updated) return res.status(404).json({ message: 'Game not found' });
+    res.json({ message: 'Game updated', game: updated });
+  } catch (error) {
+    console.error('Update game error:', error);
+    res.status(500).json({ message: 'Error updating game' });
+  }
+});
+
+// Delete a game (Admin only)
+app.delete('/api/games/:id', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ message: 'Admin access required' });
+    }
+    const { id } = req.params;
+    const deleted = await Game.findByIdAndDelete(id);
+    if (!deleted) return res.status(404).json({ message: 'Game not found' });
+    res.json({ message: 'Game deleted' });
+  } catch (error) {
+    console.error('Delete game error:', error);
+    res.status(500).json({ message: 'Error deleting game' });
+  }
 });
 
 // User Registration
@@ -160,12 +243,17 @@ app.post('/api/auth/register', async (req, res) => {
     const saltRounds = 12;
     const hashedPassword = await bcrypt.hash(password, saltRounds);
 
+    // Assign admin role if email matches (customize as needed)
+    let role = 'user';
+    if (email === 'admin@example.com') role = 'admin';
+
     // Create new user
     const newUser = new User({
       username,
       email,
       password: hashedPassword,
-      system_specs
+      system_specs,
+      role
     });
 
     await newUser.save();
@@ -174,7 +262,8 @@ app.post('/api/auth/register', async (req, res) => {
     const token = jwt.sign(
       { 
         userId: newUser._id, 
-        email: newUser.email 
+        email: newUser.email,
+        role: newUser.role
       },
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
@@ -188,7 +277,8 @@ app.post('/api/auth/register', async (req, res) => {
         username: newUser.username,
         email: newUser.email,
         system_specs: newUser.system_specs,
-        createdAt: newUser.createdAt
+        createdAt: newUser.createdAt,
+        role: newUser.role
       }
     });
 
@@ -236,7 +326,8 @@ app.post('/api/auth/login', async (req, res) => {
     const token = jwt.sign(
       { 
         userId: user._id, 
-        email: user.email 
+        email: user.email,
+        role: user.role
       },
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
@@ -250,7 +341,8 @@ app.post('/api/auth/login', async (req, res) => {
         username: user.username,
         email: user.email,
         system_specs: user.system_specs,
-        lastLogin: user.lastLogin
+        lastLogin: user.lastLogin,
+        role: user.role
       }
     });
 
@@ -275,6 +367,7 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
     res.json({
       user: {
         id: user._id,
+        username: user.username,
         email: user.email,
         system_specs: user.system_specs,
         createdAt: user.createdAt,
