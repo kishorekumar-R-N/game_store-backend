@@ -101,6 +101,7 @@ const gameSchema = new mongoose.Schema({
   image: { type: String },
   price: { type: Number, required: true },
   genre: { type: String },
+  detailsJsonUrl: { type: String }, // Store the JSON link
   createdAt: { type: Date, default: Date.now }
 });
 
@@ -140,11 +141,11 @@ app.post('/api/games', authenticateToken, async (req, res) => {
   try {
     // Removed admin-only check; any authenticated user can add games
     console.log('Add Game Request Body:', req.body); // Debug log
-    const { title, description, image, price, genre } = req.body;
+    const { title, description, image, price, genre, detailsJsonUrl } = req.body;
     if (!title || !description || !price) {
       return res.status(400).json({ message: 'Title, description, and price are required.' });
     }
-    const newGame = new Game({ title, description, image, price, genre });
+    const newGame = new Game({ title, description, image, price, genre, detailsJsonUrl });
     await newGame.save();
     res.status(201).json({ message: 'Game added successfully', game: newGame });
   } catch (error) {
@@ -188,10 +189,11 @@ app.put('/api/games/:id', authenticateToken, async (req, res) => {
 // Delete a game (Admin only)
 app.delete('/api/games/:id', authenticateToken, async (req, res) => {
   try {
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ message: 'Admin access required' });
-    }
     const { id } = req.params;
+    console.log('Delete game request:', id, req.user);
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ message: 'Invalid game ID.' });
+    }
     const deleted = await Game.findByIdAndDelete(id);
     if (!deleted) return res.status(404).json({ message: 'Game not found' });
     res.json({ message: 'Game deleted' });
