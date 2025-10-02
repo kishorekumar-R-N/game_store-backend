@@ -4,6 +4,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const dotenv = require('dotenv');
+const Razorpay = require('razorpay');
 
 // Load environment variables
 dotenv.config();
@@ -11,21 +12,48 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Initialize Razorpay instance (only if credentials are available)
+let razorpay = null;
+if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
+  razorpay = new Razorpay({
+    key_id: process.env.RAZORPAY_KEY_ID,
+    key_secret: process.env.RAZORPAY_KEY_SECRET,
+  });
+} else {
+  console.warn('Razorpay credentials not found. Payment features will be disabled.');
+}
+
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: 'http://localhost:5173', // Allow requests from frontend
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
+
+// Log all requests
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  next();
+});
 
 // MongoDB Atlas Connection
 const connectDB = async () => {
   try {
+    if (!process.env.MONGODB_URI) {
+      console.warn('MongoDB URI not found. Database features will be disabled.');
+      return;
+    }
+
     await mongoose.connect(process.env.MONGODB_URI, {
       useNewUrlParser: true,
       useUnifiedTopology: true,
     });
     console.log('MongoDB Atlas connected successfully');
   } catch (error) {
-    console.error('MongoDB connection error:', error); 
-    process.exit(1);
+    console.error('MongoDB connection error:', error);
+    console.warn('Database connection failed. Server will start without database connectivity.');
   }
 };
 
@@ -107,7 +135,52 @@ const gameSchema = new mongoose.Schema({
 
 const Game = mongoose.model('Game', gameSchema);
 
-// JWT Middleware for protected routes (SINGLE DEFINITION)
+// Cart Schema
+const cartSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  items: [{
+    gameId: { type: mongoose.Schema.Types.ObjectId, ref: 'Game', required: true },
+    title: { type: String, required: true },
+    price: { type: Number, required: true },
+    image: { type: String },
+    logo: { type: String },
+    quantity: { type: Number, default: 1, min: 1 }
+  }],
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+});
+
+const Cart = mongoose.model('Cart', cartSchema);
+
+// Order Schema
+const orderSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  gameId: { type: mongoose.Schema.Types.ObjectId, ref: 'Game', required: true },
+  title: { type: String, required: true },
+  price: { type: Number, required: true },
+  quantity: { type: Number, default: 1 },
+  paymentMethod: { type: String, required: true },
+  status: { type: String, enum: ['pending', 'completed', 'failed'], default: 'pending' },
+  orderId: { type: String, unique: true },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+});
+
+const Order = mongoose.model('Order', orderSchema);
+
+// Library Schema
+const librarySchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  games: [{
+    gameId: { type: mongoose.Schema.Types.ObjectId, ref: 'Game', required: true },
+    title: { type: String, required: true },
+    downloadUrl: { type: String, required: true },
+    addedAt: { type: Date, default: Date.now }
+  }]
+});
+
+const Library = mongoose.model('Library', librarySchema);
+
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -125,7 +198,450 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
+// Razorpay payment verification endpoint
+app.post('/api/razorpay/verify', authenticateToken, async (req, res) => {
+  try {
+    console.log('Payment verification request received:', req.body); // Debug log
+    const { 
+      razorpay_payment_id, 
+      razorpay_order_id, 
+      razorpay_signature,
+      gameId  // Add gameId to know which game to add to library
+    } = req.body;
+    
+    if (!razorpay_payment_id || !razorpay_order_id || !razorpay_signature || !gameId) {
+      console.error('Missing parameters:', { 
+        razorpay_payment_id, 
+        razorpay_order_id, 
+        razorpay_signature,
+        gameId 
+      });
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Missing payment verification parameters' 
+      });
+    }
+
+    // Step 1: Verify signature (if Razorpay secret is available)
+    if (process.env.RAZORPAY_KEY_SECRET) {
+      const crypto = require('crypto');
+      console.log('Generating signature with order_id and payment_id:', 
+        { razorpay_order_id, razorpay_payment_id }); // Debug log
+      
+      const generated_signature = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+        .update(razorpay_order_id + '|' + razorpay_payment_id)
+        .digest('hex');
+
+      console.log('Signature comparison:', { 
+        generated: generated_signature,
+        received: razorpay_signature,
+        matches: generated_signature === razorpay_signature
+      }); // Debug log
+
+      if (generated_signature !== razorpay_signature) {
+        console.error('Signature verification failed');
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid payment signature'
+        });
+      }
+      console.log('Signature verification successful'); // Debug log
+    } else {
+      console.warn('Razorpay secret not configured - skipping signature verification in test mode');
+    }
+
+    // Step 2: Verify payment status from Razorpay (if available)
+    if (razorpay) {
+      try {
+        const payment = await razorpay.payments.fetch(razorpay_payment_id);
+
+        if (payment.status !== 'captured') {
+          return res.status(400).json({
+            success: false,
+            message: 'Payment not captured'
+          });
+        }
+      } catch (apiError) {
+        console.error('Razorpay API error:', apiError);
+        return res.status(500).json({
+          success: false,
+          message: 'Payment verification service unavailable'
+        });
+      }
+    } else {
+      console.warn('Razorpay not configured - skipping payment status verification');
+    }
+
+    // Step 3: Add game to user's library (if database is available)
+    if (mongoose.connection.readyState === 1) {
+      try {
+        console.log('Looking for game with ID:', gameId); // Debug log
+        const game = await Game.findById(gameId);
+        if (!game) {
+          console.error('Game not found with ID:', gameId);
+          return res.status(404).json({
+            success: false,
+            message: 'Game not found'
+          });
+        }
+        console.log('Game found:', game.title); // Debug log
+
+        // Find or create user's library
+        console.log('Looking for library for user:', req.user.userId); // Debug log
+        let library = await Library.findOne({ userId: req.user.userId });
+        if (!library) {
+          console.log('Creating new library for user'); // Debug log
+          library = new Library({
+            userId: req.user.userId,
+            games: []
+          });
+        }
+        console.log('Current library state:', library); // Debug log
+
+        // Check if game already exists in library
+        console.log('Checking if game exists in library'); // Debug log
+        const gameExists = library.games.some(g => g.gameId.toString() === gameId);
+        if (!gameExists) {
+          console.log('Adding game to library'); // Debug log
+          library.games.push({
+            gameId: game._id,
+            title: game.title,
+            image: game.image, // Add image field
+            downloadUrl: `/api/games/download/${game._id}`,
+            addedAt: new Date()
+          });
+          const savedLibrary = await library.save();
+          console.log('Library saved successfully:', savedLibrary); // Debug log
+        } else {
+          console.log('Game already exists in library'); // Debug log
+        }
+
+        // Update order status
+        console.log('Updating order status:', razorpay_order_id); // Debug log
+        const updatedOrder = await Order.findOneAndUpdate(
+          { orderId: razorpay_order_id },
+          {
+            status: 'completed',
+            paymentId: razorpay_payment_id
+          },
+          { new: true }
+        );
+        console.log('Order updated:', updatedOrder); // Debug log
+      } catch (dbError) {
+        console.error('Database operation failed:', dbError);
+        return res.status(500).json({
+          success: false,
+          message: 'Database operation failed'
+        });
+      }
+    } else {
+      console.warn('Database not connected - skipping library operations');
+    }
+
+    res.json({
+      success: true,
+      message: 'Payment verified and game added to library',
+      orderId: razorpay_order_id,
+      paymentId: razorpay_payment_id
+    });
+  } catch (error) {
+    console.error('Razorpay verification error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error' });
+  }
+});
+
+// Add game to library endpoint
+app.post('/api/library/add', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { gameId, downloadUrl } = req.body;
+
+    if (!gameId || !downloadUrl) {
+      return res.status(400).json({ message: 'Game ID and download URL are required' });
+    }
+
+    const game = await Game.findById(gameId);
+    if (!game) {
+      return res.status(404).json({ message: 'Game not found' });
+    }
+
+    let library = await Library.findOne({ userId });
+    if (!library) {
+      library = new Library({ userId, games: [] });
+    }
+
+    // Check if game already in library
+    const exists = library.games.some(g => g.gameId.toString() === gameId);
+    if (exists) {
+      return res.status(400).json({ message: 'Game already in library' });
+    }
+
+    library.games.push({ gameId, title: game.title, downloadUrl });
+    await library.save();
+
+    res.json({ message: 'Game added to library', library });
+  } catch (error) {
+    console.error('Add to library error:', error);
+    res.status(500).json({ message: 'Error adding game to library' });
+  }
+});
+
+// Get user's library endpoint
+app.get('/api/library', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    console.log('Fetching library for user:', userId);
+    
+    const library = await Library.findOne({ userId })
+      .populate({
+        path: 'games.gameId',
+        model: 'Game',
+        select: 'title image logo price description genre'
+      });
+
+    if (!library) {
+      console.log('No library found for user');
+      return res.json({ games: [] });
+    }
+
+    console.log('Found library:', library.games);
+    res.json({ games: library.games });
+  } catch (error) {
+    console.error('Fetch library error:', error);
+    res.status(500).json({ message: 'Error fetching library' });
+  }
+});
+
+// Download game endpoint
+app.get('/api/library/download/:gameId', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { gameId } = req.params;
+
+    const library = await Library.findOne({ userId });
+    if (!library) {
+      return res.status(404).json({ message: 'Library not found' });
+    }
+
+    const gameEntry = library.games.find(g => g.gameId.toString() === gameId);
+    if (!gameEntry) {
+      return res.status(404).json({ message: 'Game not found in library' });
+    }
+
+    // For simplicity, return the download URL and a file name
+    const fileName = gameEntry.title.replace(/\s+/g, '_') + '.zip'; // Assuming zip file
+
+    res.json({ downloadUrl: gameEntry.downloadUrl, fileName });
+  } catch (error) {
+    console.error('Download game error:', error);
+    res.status(500).json({ message: 'Error processing download' });
+  }
+});
+
 // Routes
+
+// Log all incoming requests for debugging
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  next();
+});
+
+// Razorpay payment verification endpoint
+app.post('/api/razorpay/verify', async (req, res) => {
+  try {
+    console.log('Payment verification request received:', {
+      body: req.body,
+      headers: req.headers,
+      url: req.url,
+      method: req.method
+    });
+    
+    const { 
+      razorpay_payment_id, 
+      razorpay_order_id, 
+      razorpay_signature,
+      gameId
+    } = req.body;
+
+    console.log('Extracted payment details:', {
+      razorpay_payment_id,
+      razorpay_order_id,
+      razorpay_signature,
+      gameId
+    });
+    
+    if (!razorpay_payment_id || !razorpay_order_id || !razorpay_signature || !gameId) {
+      console.error('Missing parameters in webhook:', req.body);
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Missing payment verification parameters' 
+      });
+    }
+
+    // Verify signature
+    if (process.env.RAZORPAY_KEY_SECRET) {
+      const crypto = require('crypto');
+      const generated_signature = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+        .update(razorpay_order_id + '|' + razorpay_payment_id)
+        .digest('hex');
+
+      console.log('Signature verification:', {
+        generated: generated_signature,
+        received: razorpay_signature
+      });
+
+      if (generated_signature !== razorpay_signature) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid payment signature'
+        });
+      }
+    }
+
+    // Validate gameId
+    if (!gameId) {
+      console.error('GameId is missing in the request');
+      return res.status(400).json({
+        success: false,
+        message: 'GameId is required'
+      });
+    }
+
+    // Log all games in the database for debugging
+    console.log('Listing all games in database:');
+    const allGames = await Game.find({}, '_id title');
+    console.log('Available games:', allGames);
+
+    // Try to find the game with flexible ID format
+    console.log('Searching for game with ID:', gameId);
+    let game;
+    try {
+      // Try direct ID first
+      game = await Game.findById(gameId);
+      
+      // If not found, try searching without case sensitivity
+      if (!game) {
+        const games = await Game.find({});
+        game = games.find(g => g._id.toString().toLowerCase() === gameId.toLowerCase());
+      }
+    } catch (error) {
+      console.error('Error finding game:', error);
+    }
+
+    // If still not found, return error
+    if (!game) {
+      console.error('Game not found with ID:', gameId);
+      return res.status(404).json({
+        success: false,
+        message: 'Game not found. Available IDs: ' + allGames.map(g => g._id).join(', ')
+      });
+    }
+
+    console.log('Found game:', game);
+    if (!game) {
+      console.error('Game not found for ID:', gameId);
+      return res.status(404).json({
+        success: false,
+        message: 'Game not found'
+      });
+    }
+    
+    console.log('Found game:', {
+      title: game.title,
+      id: game._id
+    });
+
+    // Find the order
+    console.log('Searching for order:', razorpay_order_id);
+    const order = await Order.findOne({ orderId: razorpay_order_id });
+    
+    let userId;
+    if (!order) {
+      console.log('Order not found in database, checking payment with Razorpay');
+      if (!razorpay) {
+        console.error('Razorpay not configured');
+        return res.status(500).json({
+          success: false,
+          message: 'Payment service unavailable'
+        });
+      }
+
+      try {
+        const payment = await razorpay.payments.fetch(razorpay_payment_id);
+        console.log('Razorpay payment details:', payment);
+        
+        // Create a new order since it doesn't exist
+        const newOrder = new Order({
+          orderId: razorpay_order_id,
+          paymentId: razorpay_payment_id,
+          gameId: gameId,
+          status: 'completed',
+          userId: payment.notes && payment.notes.userId ? payment.notes.userId : null
+        });
+        
+        await newOrder.save();
+        console.log('Created new order:', newOrder);
+        userId = newOrder.userId;
+      } catch (err) {
+        console.error('Failed to fetch/create payment:', err);
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to verify payment'
+        });
+      }
+    } else {
+      console.log('Found existing order:', order);
+      userId = order.userId;
+    }
+
+    if (!userId) {
+      console.error('No userId found in order or payment');
+      return res.status(400).json({
+        success: false,
+        message: 'User information missing'
+      });
+    }
+
+    // Update user's library
+    let library = await Library.findOne({ userId: order.userId });
+    if (!library) {
+      library = new Library({
+        userId: order.userId,
+        games: []
+      });
+    }
+
+    // Add game if not already in library
+    const gameExists = library.games.some(g => g.gameId.toString() === gameId);
+    if (!gameExists) {
+      library.games.push({
+        gameId: game._id,
+        title: game.title,
+        downloadUrl: `/api/games/download/${game._id}`,
+        addedAt: new Date()
+      });
+      await library.save();
+      console.log('Game added to library:', game.title);
+    }
+
+    // Update order status
+    order.status = 'completed';
+    order.paymentId = razorpay_payment_id;
+    await order.save();
+    console.log('Order updated:', order);
+
+    res.json({
+      success: true,
+      message: 'Payment verified and game added to library'
+    });
+  } catch (error) {
+    console.error('Payment verification error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Internal server error during payment verification' 
+    });
+  }
+});
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
@@ -134,6 +650,38 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString(),
     status: 'healthy'
   });
+});
+
+// Razorpay order creation endpoint
+app.post('/api/razorpay/order', authenticateToken, async (req, res) => {
+  try {
+    if (!razorpay) {
+      return res.status(503).json({ message: 'Payment service unavailable' });
+    }
+
+    const { amount, currency = 'INR', receipt } = req.body;
+
+    if (!amount || !receipt) {
+      return res.status(400).json({ message: 'Amount and receipt are required' });
+    }
+
+    const options = {
+      amount: amount * 100, // amount in the smallest currency unit (paise)
+      currency,
+      receipt,
+      payment_capture: 1
+    };
+
+    const order = await razorpay.orders.create(options);
+
+    res.json({
+      success: true,
+      order
+    });
+  } catch (error) {
+    console.error('Razorpay order creation error:', error);
+    res.status(500).json({ message: 'Error creating Razorpay order' });
+  }
 });
 
 // Add a new game (Admin only)
@@ -417,6 +965,202 @@ app.put('/api/user/specs', authenticateToken, async (req, res) => {
     res.status(500).json({ 
       message: 'Error updating system specifications' 
     });
+  }
+});
+
+// Cart API Endpoints
+
+// Get user's cart
+app.get('/api/cart', authenticateToken, async (req, res) => {
+  try {
+    let cart = await Cart.findOne({ userId: req.user.userId });
+    if (!cart) {
+      cart = { items: [], totalAmount: 0 };
+    }
+    res.json({ cart: cart });
+  } catch (error) {
+    console.error('Get cart error:', error);
+    res.status(500).json({ message: 'Error fetching cart' });
+  }
+});
+
+// Add item to cart
+app.post('/api/cart/add', authenticateToken, async (req, res) => {
+  try {
+    const { gameId, title, price, image, logo, quantity = 1 } = req.body;
+    
+    if (!gameId || !title || !price) {
+      return res.status(400).json({ message: 'Game ID, title, and price are required' });
+    }
+
+    let cart = await Cart.findOne({ userId: req.user.userId });
+    
+    if (!cart) {
+      // Create new cart
+      cart = new Cart({
+        userId: req.user.userId,
+        items: [{
+          gameId,
+          title,
+          price: Number(price),
+          image,
+          logo,
+          quantity: Number(quantity)
+        }]
+      });
+    } else {
+      // Check if item already exists in cart
+      const existingItemIndex = cart.items.findIndex(item => item.gameId.toString() === gameId);
+      
+      if (existingItemIndex > -1) {
+        // Update quantity
+        cart.items[existingItemIndex].quantity += Number(quantity);
+      } else {
+        // Add new item
+        cart.items.push({
+          gameId,
+          title,
+          price: Number(price),
+          image,
+          logo,
+          quantity: Number(quantity)
+        });
+      }
+      cart.updatedAt = new Date();
+    }
+    
+    await cart.save();
+    res.json({ message: 'Item added to cart', cart });
+  } catch (error) {
+    console.error('Add to cart error:', error);
+    res.status(500).json({ message: 'Error adding item to cart' });
+  }
+});
+
+// Update cart item quantity
+app.put('/api/cart/update', authenticateToken, async (req, res) => {
+  try {
+    const { gameId, quantity } = req.body;
+    
+    if (!gameId || quantity < 0) {
+      return res.status(400).json({ message: 'Valid game ID and quantity are required' });
+    }
+
+    const cart = await Cart.findOne({ userId: req.user.userId });
+    if (!cart) {
+      return res.status(404).json({ message: 'Cart not found' });
+    }
+
+    if (quantity === 0) {
+      // Remove item from cart
+      cart.items = cart.items.filter(item => item.gameId.toString() !== gameId);
+    } else {
+      // Update quantity
+      const itemIndex = cart.items.findIndex(item => item.gameId.toString() === gameId);
+      if (itemIndex > -1) {
+        cart.items[itemIndex].quantity = Number(quantity);
+      } else {
+        return res.status(404).json({ message: 'Item not found in cart' });
+      }
+    }
+    
+    cart.updatedAt = new Date();
+    await cart.save();
+    res.json({ message: 'Cart updated', cart });
+  } catch (error) {
+    console.error('Update cart error:', error);
+    res.status(500).json({ message: 'Error updating cart' });
+  }
+});
+
+// Remove item from cart
+app.delete('/api/cart/remove/:gameId', authenticateToken, async (req, res) => {
+  try {
+    const { gameId } = req.params;
+    
+    const cart = await Cart.findOne({ userId: req.user.userId });
+    if (!cart) {
+      return res.status(404).json({ message: 'Cart not found' });
+    }
+
+    cart.items = cart.items.filter(item => item.gameId.toString() !== gameId);
+    cart.updatedAt = new Date();
+    await cart.save();
+    
+    res.json({ message: 'Item removed from cart', cart });
+  } catch (error) {
+    console.error('Remove from cart error:', error);
+    res.status(500).json({ message: 'Error removing item from cart' });
+  }
+});
+
+// Clear cart
+app.delete('/api/cart/clear', authenticateToken, async (req, res) => {
+  try {
+    await Cart.findOneAndDelete({ userId: req.user.userId });
+    res.json({ message: 'Cart cleared' });
+  } catch (error) {
+    console.error('Clear cart error:', error);
+    res.status(500).json({ message: 'Error clearing cart' });
+  }
+});
+
+// Purchase endpoint
+app.post('/api/purchase', authenticateToken, async (req, res) => {
+  try {
+    const { gameId, paymentMethod } = req.body;
+    const userId = req.user.userId;
+
+    if (!gameId || !paymentMethod) {
+      return res.status(400).json({ message: 'Game ID and payment method are required' });
+    }
+
+    // Validate game exists
+    const game = await Game.findById(gameId);
+    if (!game) {
+      return res.status(404).json({ message: 'Game not found' });
+    }
+
+    // Validate user exists
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    // Generate unique order ID
+    const orderId = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+    // Create order
+    const order = new Order({
+      userId,
+      gameId,
+      title: game.title,
+      price: game.price,
+      paymentMethod,
+      orderId,
+      status: 'pending'
+    });
+
+    await order.save();
+
+    // For now, simulate payment gateway redirect
+    // In real implementation, integrate with Stripe, PayPal, etc.
+    const redirectUrl = `https://payment-gateway.com/pay?orderId=${orderId}&amount=${game.price}`;
+
+    res.json({
+      message: 'Order created successfully',
+      order: {
+        orderId,
+        gameTitle: game.title,
+        price: game.price,
+        paymentMethod,
+        status: 'pending',
+        redirectUrl // Simulated
+      }
+    });
+  } catch (error) {
+    console.error('Purchase error:', error);
+    res.status(500).json({ message: 'Error processing purchase' });
   }
 });
 
