@@ -1,16 +1,34 @@
-const express = require('express');
-const mongoose = require('mongoose');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const cors = require('cors');
-const dotenv = require('dotenv');
-const Razorpay = require('razorpay');
+import express from 'express';
+import mongoose from 'mongoose';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import Razorpay from 'razorpay';
+import fetch from 'node-fetch';
+import https from 'https';
+import crypto from 'crypto';
+import { sendEmail, smtpIsConfigured } from './utils/emailService.js';
 
 // Load environment variables
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// Middleware
+app.use(cors({
+  origin: 'http://localhost:5173', // Allow requests from frontend
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+app.use(express.json());
+
+// Configure HTTPS agent for insecure requests
+const agent = new https.Agent({
+  rejectUnauthorized: false // Ignore SSL certificate issues
+});
 
 // Initialize Razorpay instance (only if credentials are available)
 let razorpay = null;
@@ -22,15 +40,6 @@ if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
 } else {
   console.warn('Razorpay credentials not found. Payment features will be disabled.');
 }
-
-// Middleware
-app.use(cors({
-  origin: 'http://localhost:5173', // Allow requests from frontend
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
-app.use(express.json());
 
 // Log all requests
 app.use((req, res, next) => {
@@ -117,6 +126,13 @@ const userSchema = new mongoose.Schema({
     enum: ['user', 'admin'],
     default: 'user'
   }
+  ,
+  // Keep track of ratings given by this user across games
+  ratings: [{ gameId: { type: mongoose.Schema.Types.ObjectId, ref: 'Game' }, value: Number, updatedAt: { type: Date, default: Date.now } }]
+  ,
+  // Password reset token and expiry
+  resetPasswordToken: { type: String },
+  resetPasswordExpires: { type: Date }
 });
 
 // Create User model
@@ -130,10 +146,20 @@ const gameSchema = new mongoose.Schema({
   price: { type: Number, required: true },
   genre: { type: String },
   detailsJsonUrl: { type: String }, // Store the JSON link
+  // Ratings: store per-user ratings and aggregates (average/count/total)
+  ratings: {
+    total: { type: Number, default: 0 }, // sum of all rating values
+    count: { type: Number, default: 0 }, // number of ratings
+    average: { type: Number, default: 0 },
+    // Optional: keep per-user ratings to prevent duplicate votes and allow updates
+    userRatings: [{ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, value: Number }]
+  },
   createdAt: { type: Date, default: Date.now }
 });
 
 const Game = mongoose.model('Game', gameSchema);
+
+
 
 // Cart Schema
 const cartSchema = new mongoose.Schema({
@@ -198,6 +224,142 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
+// Rating endpoints for games
+// Submit or update a rating (1-5) for a game
+app.post('/api/games/:id/rate', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { rating } = req.body;
+    const userId = req.user && req.user.userId;
+
+    // Basic validation
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ message: 'Invalid game ID' });
+    }
+
+    const ratingNum = Number(rating);
+    if (!rating || Number.isNaN(ratingNum) || ratingNum < 1 || ratingNum > 5) {
+      return res.status(400).json({ message: 'Rating must be a number between 1 and 5' });
+    }
+
+    const game = await Game.findById(id);
+    if (!game) return res.status(404).json({ message: 'Game not found' });
+
+    // Ensure ratings structure exists to avoid runtime errors
+    game.ratings = game.ratings || {};
+    game.ratings.userRatings = Array.isArray(game.ratings.userRatings) ? game.ratings.userRatings : [];
+    game.ratings.total = typeof game.ratings.total === 'number' ? game.ratings.total : 0;
+    game.ratings.count = typeof game.ratings.count === 'number' ? game.ratings.count : 0;
+
+    // Check if user has already rated
+    const existing = game.ratings.userRatings.find(r => r.userId && r.userId.toString() === String(userId));
+
+    if (existing) {
+      // Update totals by removing old value and adding new
+      game.ratings.total = game.ratings.total - existing.value + ratingNum;
+      existing.value = ratingNum;
+    } else {
+      // New rating
+  game.ratings.userRatings.push({ userId: new mongoose.Types.ObjectId(userId), value: ratingNum });
+      game.ratings.total = game.ratings.total + ratingNum;
+      game.ratings.count = game.ratings.count + 1;
+    }
+
+    // Recalculate average
+    game.ratings.average = game.ratings.count > 0 ? (game.ratings.total / game.ratings.count) : 0;
+
+    await game.save();
+
+    // Also persist the user's rating on their profile for quick lookup
+    try {
+      if (userId) {
+        const user = await User.findById(userId);
+        if (user) {
+          user.ratings = Array.isArray(user.ratings) ? user.ratings : [];
+          const existingUserRating = user.ratings.find(r => r.gameId && r.gameId.toString() === id);
+          if (existingUserRating) {
+            existingUserRating.value = ratingNum;
+            existingUserRating.updatedAt = new Date();
+          } else {
+            user.ratings.push({ gameId: new mongoose.Types.ObjectId(id), value: ratingNum, updatedAt: new Date() });
+          }
+          await user.save();
+        }
+      }
+    } catch (userRatingErr) {
+      console.warn('Failed to persist user rating to user profile:', userRatingErr);
+    }
+
+    res.json({
+      message: 'Rating saved',
+      rating: {
+        average: game.ratings.average,
+        count: game.ratings.count,
+        total: game.ratings.total,
+        percentage: Math.round(((game.ratings.average || 0) / 5) * 100)
+      }
+    });
+  } catch (error) {
+    console.error('Rate game error:', error && error.stack ? error.stack : error);
+    res.status(500).json({ message: 'Error saving rating', error: error && error.message ? error.message : String(error) });
+  }
+});
+
+// Get rating summary for a game (optional user-specific rating if authenticated)
+app.get('/api/games/:id/rating', async (req, res) => {
+  try {
+    const { id } = req.params;
+    let userId = null;
+    // Try to extract token from header to identify user's rating (non-blocking)
+    const authHeader = req.headers['authorization'];
+    if (authHeader) {
+      const token = authHeader.split(' ')[1];
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        userId = decoded.userId;
+      } catch (e) {
+        // ignore invalid token
+      }
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ message: 'Invalid game ID' });
+    }
+
+    const game = await Game.findById(id).lean();
+    if (!game) return res.status(404).json({ message: 'Game not found' });
+
+    const summary = {
+      average: game.ratings?.average || 0,
+      count: game.ratings?.count || 0,
+      total: game.ratings?.total || 0,
+      userRating: null,
+      userRatingsCount: null
+    };
+
+    if (userId && game.ratings && Array.isArray(game.ratings.userRatings)) {
+      const ur = game.ratings.userRatings.find(r => r.userId && r.userId.toString() === userId);
+      if (ur) summary.userRating = ur.value;
+      try {
+        const user = await User.findById(userId).lean();
+        if (user && Array.isArray(user.ratings)) {
+          summary.userRatingsCount = user.ratings.length;
+        }
+      } catch (e) {
+        // ignore user lookup errors
+      }
+    }
+
+  // include percentage (0-100) based on average out of 5
+  summary.percentage = Math.round(((summary.average || 0) / 5) * 100);
+
+  res.json(summary);
+  } catch (error) {
+    console.error('Get game rating error:', error);
+    res.status(500).json({ message: 'Error fetching rating' });
+  }
+});
+
 // Razorpay payment verification endpoint
 app.post('/api/razorpay/verify', authenticateToken, async (req, res) => {
   try {
@@ -224,7 +386,7 @@ app.post('/api/razorpay/verify', authenticateToken, async (req, res) => {
 
     // Step 1: Verify signature (if Razorpay secret is available)
     if (process.env.RAZORPAY_KEY_SECRET) {
-      const crypto = require('crypto');
+      // crypto is imported at the top of the file
       console.log('Generating signature with order_id and payment_id:', 
         { razorpay_order_id, razorpay_payment_id }); // Debug log
       
@@ -480,7 +642,7 @@ app.post('/api/razorpay/verify', async (req, res) => {
 
     // Verify signature
     if (process.env.RAZORPAY_KEY_SECRET) {
-      const crypto = require('crypto');
+      // crypto is imported at the top of the file
       const generated_signature = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
         .update(razorpay_order_id + '|' + razorpay_payment_id)
         .digest('hex');
@@ -650,6 +812,28 @@ app.get('/api/health', (req, res) => {
     timestamp: new Date().toISOString(),
     status: 'healthy'
   });
+});
+
+// Epic Games News endpoint
+import { fetchEpicNews } from "./epicNews.js";
+
+app.get("/api/news", async (req, res) => {
+  try {
+    console.log("Fetching Epic Games news via Puppeteer...");
+    const newsItems = await fetchEpicNews();
+    
+    console.log(`✅ Successfully fetched ${newsItems.length} news items`);
+    res.json(newsItems);
+  } catch (err) {
+    console.error("Epic Games news error:", {
+      message: err.message,
+      stack: err.stack
+    });
+    res.status(500).json({
+      error: "Failed to fetch Epic Games news",
+      message: err.message
+    });
+  }
 });
 
 // Razorpay order creation endpoint
@@ -901,6 +1085,82 @@ app.post('/api/auth/login', async (req, res) => {
     res.status(500).json({ 
       message: 'Internal server error during login' 
     });
+  }
+});
+
+// Forgot password - generate reset token (development: return token in response)
+app.post('/api/auth/forgot', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ message: 'Email is required' });
+    // Try to find the user, but do not reveal whether the email exists in the response.
+    const user = await User.findOne({ email });
+
+    // If user exists, generate and store a reset token
+    if (user) {
+      const token = crypto.randomBytes(32).toString('hex');
+      user.resetPasswordToken = token;
+      user.resetPasswordExpires = Date.now() + (60 * 60 * 1000); // 1 hour
+      await user.save();
+
+      // Build reset link
+      const frontendBase = process.env.FRONTEND_URL || 'http://localhost:5173';
+      const resetLink = `${frontendBase}/reset-password?token=${token}&email=${encodeURIComponent(email)}`;
+
+      // If SMTP configured, attempt to send email. If it fails, log the error but still return a generic success response.
+      if (smtpIsConfigured()) {
+        try {
+          const html = `
+            <p>Hi ${user.username || ''},</p>
+            <p>You requested a password reset. Click the link below to reset your password. This link will expire in 1 hour.</p>
+            <p><a href="${resetLink}">Reset your password</a></p>
+            <p>If the link does not work you can also use the following reset token in the password reset form:</p>
+            <pre style="background:#f4f4f4;padding:10px;border-radius:4px;overflow:auto">${token}</pre>
+            <p>Or paste the following URL into your browser:</p>
+            <p><a href="${resetLink}">${resetLink}</a></p>
+            <p>If you did not request this, you can safely ignore this email.</p>
+          `;
+
+          await sendEmail(email, 'Password reset for your account', html);
+          console.log('Password reset email sent to', email);
+        } catch (emailErr) {
+          console.error('Failed to send password reset email:', emailErr && emailErr.message ? emailErr.message : emailErr);
+        }
+      } else {
+        // SMTP not configured: for security, do NOT return the token in the API response.
+        console.warn('SMTP not configured - password reset token generated but email not sent for', email);
+        // For local debugging you can find the token in server logs if needed.
+        console.log('Password reset token for', email, ':', user.resetPasswordToken);
+      }
+    }
+
+    // Always return a generic success message so callers cannot enumerate valid emails.
+    res.json({ message: 'If an account with that email exists, a password reset link has been sent.' });
+  } catch (error) {
+    console.error('Forgot password error:', error);
+    res.status(500).json({ message: 'Error generating reset token' });
+  }
+});
+
+// Reset password using token
+app.post('/api/auth/reset', async (req, res) => {
+  try {
+    const { token, newPassword } = req.body;
+    if (!token || !newPassword) return res.status(400).json({ message: 'Token and newPassword are required' });
+
+    const user = await User.findOne({ resetPasswordToken: token, resetPasswordExpires: { $gt: Date.now() } });
+    if (!user) return res.status(400).json({ message: 'Invalid or expired token' });
+
+    const saltRounds = 12;
+    user.password = await bcrypt.hash(newPassword, saltRounds);
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpires = undefined;
+    await user.save();
+
+    res.json({ message: 'Password has been reset successfully' });
+  } catch (error) {
+    console.error('Reset password error:', error);
+    res.status(500).json({ message: 'Error resetting password' });
   }
 });
 
@@ -1254,12 +1514,11 @@ app.use((req, res) => {
 // Start server
 const startServer = async () => {
   await connectDB();
-  app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    console.log(`Health check: http://localhost:${PORT}/api/health`);
-  });
+  app.listen(PORT, () => 
+    console.log(`✅ Server running on http://localhost:${PORT}`)
+  );
 };
 
 startServer().catch(console.error);
 
-module.exports = app;
+export default app;
