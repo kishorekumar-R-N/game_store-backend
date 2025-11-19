@@ -815,26 +815,7 @@ app.get('/api/health', (req, res) => {
 });
 
 // Epic Games News endpoint
-import { fetchEpicNews } from "./epicNews.js";
-
-app.get("/api/news", async (req, res) => {
-  try {
-    console.log("Fetching Epic Games news via Puppeteer...");
-    const newsItems = await fetchEpicNews();
-    
-    console.log(`✅ Successfully fetched ${newsItems.length} news items`);
-    res.json(newsItems);
-  } catch (err) {
-    console.error("Epic Games news error:", {
-      message: err.message,
-      stack: err.stack
-    });
-    res.status(500).json({
-      error: "Failed to fetch Epic Games news",
-      message: err.message
-    });
-  }
-});
+// Epic Games news scraping removed (Puppeteer dependency removed)
 
 // Razorpay order creation endpoint
 app.post('/api/razorpay/order', authenticateToken, async (req, res) => {
