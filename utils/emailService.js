@@ -21,7 +21,10 @@ if (SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS) {
       auth: {
         user: SMTP_USER,
         pass: SMTP_PASS
-      }
+      },
+      connectionTimeout: 10000, // 10 seconds
+      debug: true, // Enable debugging logs
+      logger: true // Enable detailed logs
     });
 
     // Mark transporter as available immediately; verification runs asynchronously.
@@ -42,6 +45,10 @@ if (SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS) {
   }
 } else {
   console.log('SMTP settings not fully configured. Email sending is disabled.');
+  if (!SMTP_HOST) console.warn('Missing SMTP_HOST');
+  if (!SMTP_PORT) console.warn('Missing SMTP_PORT');
+  if (!SMTP_USER) console.warn('Missing SMTP_USER');
+  if (!SMTP_PASS) console.warn('Missing SMTP_PASS');
 }
 
 /**

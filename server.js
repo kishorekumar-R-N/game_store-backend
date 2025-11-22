@@ -17,17 +17,11 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // Middleware
-// Allow configuring one or more frontend origins via FRONTEND_URL (set this on Render/Netlify)
-// FRONTEND_URL may be a single origin or a comma-separated list of origins.
-// const rawFrontend = process.env.FRONTEND_URL || 'http://localhost:5173';
-// const frontendOrigins = rawFrontend.split(',').map(s => s.trim()).filter(Boolean);
-// Always allow localhost dev addresses as well
-// const CORS_ALLOWED_ORIGINS = Array.from(new Set([...frontendOrigins, 'http://localhost:5173', 'http://127.0.0.1:5173']));
-
 app.use(cors({
-  origin: "https://game-store-frontend-x59u.onrender.com",
-  methods: ["GET", "POST", "PUT", "DELETE"],
-  credentials: true
+  origin: 'http://localhost:5173', // Allow requests from frontend
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(express.json());
 
